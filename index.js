@@ -100,7 +100,7 @@ app.post('/twilio/incoming', (req, res) => {
 </Response>`;
   res.type('text/xml').send(twiml);
 });
-require('./supervised')(app);
+
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/media' });
 
@@ -169,6 +169,9 @@ async function dropVoicemail(callSid, agentNumber) {
     );
   }
 }
+
+// Supervised conference routes (customer + agent + you, listen/barge).
+require('./supervised')(app);
 
 initDb()
   .then(() => server.listen(PORT, () => console.log(`listening on ${PORT}`)))
