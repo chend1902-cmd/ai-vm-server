@@ -122,7 +122,7 @@ module.exports = function mountSupervised(app) {
   app.post('/sup-customer-twiml', (_req, res) => {
     const conf = active ? active.conf : 'sup-none';
     res.type('text/xml').send(
-      `<Response><Dial><Conference startConferenceOnEnter="true" endConferenceOnExit="true">${conf}</Conference></Dial></Response>`
+      `<Response><Dial><Conference waitUrl="" startConferenceOnEnter="true" endConferenceOnExit="true">${conf}</Conference></Dial></Response>`
     );
   });
 
@@ -151,6 +151,7 @@ module.exports = function mountSupervised(app) {
           muted: true,
           beep: false,
           earlyMedia: true,
+          waitUrl: '',
         });
       }
       await triggerAgent();
@@ -186,7 +187,7 @@ module.exports = function mountSupervised(app) {
     if (!active) return res.type('text/xml').send('<Response><Hangup/></Response>');
     active.agentBridgeCallSid = req.body.CallSid;
     res.type('text/xml').send(
-      `<Response><Dial><Conference startConferenceOnEnter="true" endConferenceOnExit="false">${active.conf}</Conference></Dial></Response>`
+      `<Response><Dial><Conference waitUrl="" startConferenceOnEnter="true" endConferenceOnExit="false">${active.conf}</Conference></Dial></Response>`
     );
   });
 
