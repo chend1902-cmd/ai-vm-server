@@ -100,7 +100,7 @@ app.post('/twilio/incoming', (req, res) => {
 </Response>`;
   res.type('text/xml').send(twiml);
 });
-
+require('./supervised')(app);
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/media' });
 
