@@ -1,17 +1,19 @@
-// supervised.js — Supervised conference (one call at a time), NO AMD.
+// supervised.js — Supervised conference (one call at a time), NO AMD, NO bridge.
 //
-// You're on every supervised call, so we don't try to auto-detect voicemail.
-// The moment the customer answers, they join a conference; we add you (muted) and
-// bring the ElevenLabs agent in via the bridge. You listen, then Take Over to barge in.
+// New approach: instead of ElevenLabs dialing OUT to a bridge (which won't route to a
+// same-account Twilio number), our conference dials INTO the ElevenLabs agent's inbound
+// number. ElevenLabs answers inbound with the agent and lands in the conference.
 //
 //   customer answers -> joins conference
-//   ~1.5s later       -> you (rep) added muted + agent dialed into the bridge
-//   take over         -> unmute you + drop the agent
+//   ~1.5s later       -> you (rep) added muted + agent number dialed into the conference
+//   take over         -> unmute you + drop the agent leg
 //
 // Mount from index.js:  require('./supervised')(app);
 // Env: PUBLIC_HOST, DATABASE_URL, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_NUMBER,
-//      REP_CELL, ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ELEVENLABS_API_KEY,
-//      ELEVENLABS_AGENT_ID, ELEVENLABS_AGENT_PHONE_ID, BRIDGE_NUMBER, REP_NAME
+//      REP_CELL, ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ELEVENLABS_AGENT_NUMBER, REP_NAME
+//
+// IMPORTANT: ELEVENLABS_AGENT_NUMBER is the agent's PHONE NUMBER (+15618165103), and that
+// number must accept INBOUND calls routed to the agent (it's assigned to Stevie in ElevenLabs).
 
 const twilio = require('twilio');
 const { Pool } = require('pg');
@@ -26,10 +28,7 @@ module.exports = function mountSupervised(app) {
     REP_CELL,
     ANTHROPIC_API_KEY,
     ANTHROPIC_MODEL,
-    ELEVENLABS_API_KEY,
-    ELEVENLABS_AGENT_ID,
-    ELEVENLABS_AGENT_PHONE_ID,
-    BRIDGE_NUMBER,
+    ELEVENLABS_AGENT_NUMBER,
     REP_NAME,
   } = process.env;
 
@@ -37,8 +36,7 @@ module.exports = function mountSupervised(app) {
   const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
   const domain = `https://${PUBLIC_HOST}`;
 
-  // One supervised call at a time.
-  let active = null; // { conf, fields, customerCallSid, agentBridgeCallSid, brought }
+  let active = null; // { conf, fields, customerCallSid, agentCallSid, brought }
 
   async function extractFields(screenText) {
     const fallback = {
@@ -88,7 +86,7 @@ module.exports = function mountSupervised(app) {
       if (!to) return res.json({ ok: false, error: 'No customer number' });
       const fields = await extractFields(req.body.screenText || '');
       const conf = 'sup-' + Date.now();
-      active = { conf, fields, customerCallSid: null, agentBridgeCallSid: null, brought: false };
+      active = { conf, fields, customerCallSid: null, agentCallSid: null, brought: false };
 
       const call = await client.calls.create({
         to,
@@ -104,13 +102,12 @@ module.exports = function mountSupervised(app) {
     }
   });
 
-  // Customer answered -> join the conference, and bring in rep + agent shortly after.
+  // Customer answered -> join the conference, then bring in rep + agent.
   app.post('/sup-customer-twiml', (_req, res) => {
     const conf = active ? active.conf : 'sup-none';
     res.type('text/xml').send(
       `<Response><Dial><Conference waitUrl="" startConferenceOnEnter="true" endConferenceOnExit="true">${conf}</Conference></Dial></Response>`
     );
-    // Give the conference ~1.5s to come up, then add you (muted) + the agent.
     if (active && !active.brought) {
       active.brought = true;
       setTimeout(() => bringInRepAndAgent().catch((e) => console.error('bringIn error', e.message)), 1500);
@@ -119,56 +116,42 @@ module.exports = function mountSupervised(app) {
 
   async function bringInRepAndAgent() {
     const confSid = await confSidByName(active.conf);
-    if (confSid) {
-      await client.conferences(confSid).participants.create({
+    if (!confSid) {
+      console.error('bringIn: conference not found yet for', active.conf);
+      return;
+    }
+    // Add you (the rep), muted, listening.
+    await client
+      .conferences(confSid)
+      .participants.create({
         from: TWILIO_NUMBER,
         to: REP_CELL,
         muted: true,
         beep: false,
         earlyMedia: true,
         waitUrl: '',
-      });
-    } else {
-      console.error('bringIn: conference not found yet for', active.conf);
-    }
-    await triggerAgent();
+      })
+      .then(() => console.log('rep added (muted)'))
+      .catch((e) => console.error('addRep error', e.message));
+
+    // Dial the ElevenLabs agent's inbound number INTO the conference.
+    await client
+      .conferences(confSid)
+      .participants.create({
+        from: TWILIO_NUMBER,
+        to: ELEVENLABS_AGENT_NUMBER,
+        beep: false,
+        earlyMedia: true,
+        waitUrl: '',
+      })
+      .then((p) => {
+        active.agentCallSid = p.callSid;
+        console.log('agent dialed into conference', p.callSid);
+      })
+      .catch((e) => console.error('addAgent error', e.message));
+
     await logCall('supervised_live');
   }
-
-  async function triggerAgent() {
-    const r = await fetch('https://api.elevenlabs.io/v1/convai/twilio/outbound-call', {
-      method: 'POST',
-      headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        agent_id: ELEVENLABS_AGENT_ID,
-        agent_phone_number_id: ELEVENLABS_AGENT_PHONE_ID,
-        to_number: BRIDGE_NUMBER,
-        conversation_initiation_client_data: {
-          dynamic_variables: {
-            customer_name: active.fields.customer_name,
-            vehicle: active.fields.vehicle,
-            lead_source: active.fields.lead_source,
-            rep_name: REP_NAME || 'your rep',
-          },
-        },
-      }),
-    });
-    if (!r.ok) {
-      const t = await r.text();
-      console.error('triggerAgent ElevenLabs error', r.status, t);
-    } else {
-      console.log('triggerAgent ok');
-    }
-  }
-
-  // The ElevenLabs agent's call lands on BRIDGE_NUMBER -> join the conference.
-  app.post('/agent-bridge', (req, res) => {
-    if (!active) return res.type('text/xml').send('<Response><Hangup/></Response>');
-    active.agentBridgeCallSid = req.body.CallSid;
-    res.type('text/xml').send(
-      `<Response><Dial><Conference waitUrl="" startConferenceOnEnter="true" endConferenceOnExit="false">${active.conf}</Conference></Dial></Response>`
-    );
-  });
 
   // Take over: unmute you, drop the agent leg.
   app.post('/take-over', async (req, res) => {
@@ -178,7 +161,7 @@ module.exports = function mountSupervised(app) {
       if (confSid) {
         const parts = await client.conferences(confSid).participants.list();
         for (const p of parts) {
-          if (p.callSid === active.agentBridgeCallSid) {
+          if (p.callSid === active.agentCallSid) {
             await client.conferences(confSid).participants(p.callSid).remove().catch(() => {});
           } else if (p.callSid !== active.customerCallSid) {
             await client
